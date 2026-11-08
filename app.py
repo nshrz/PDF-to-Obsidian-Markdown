@@ -4,6 +4,15 @@ import runner
 
 st.set_page_config(page_title="PDF slides to Markdown", page_icon="📝", layout="centered")
 
+# hide Streamlit's built-in "200MB per file • PDF" hint (our own label above the box states the real limits)
+st.markdown(
+    "<style>"
+    '[data-testid="stFileUploaderDropzoneInstructions"]{display:none !important;}'
+    '[data-testid="stFileUploaderDropzone"] small{display:none !important;}'
+    "</style>",
+    unsafe_allow_html=True,
+)
+
 
 @st.cache_resource
 def shared():

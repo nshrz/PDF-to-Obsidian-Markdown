@@ -5,8 +5,9 @@ import io, os, re, time, threading, zipfile, tempfile, contextlib, collections, 
 import pdf2md_core as core
 
 # ---- limits (change these if you like) ----
-MAX_FILES = 3                 # PDFs per click
+MAX_FILES = 6                 # PDFs per click
 MAX_MB = 60                   # per PDF
+MAX_TOTAL_MB = 150            # all PDFs of one click together
 MAX_PAGES = 400               # per PDF
 MAX_SECONDS = 15 * 60         # a single PDF that runs longer than this is stopped so it cannot block everyone
 MAX_WAITING = 5               # people allowed to wait in line; more than this are asked to come back later
@@ -112,7 +113,22 @@ def check_pdf(name, data):
     return None
 
 
-def process_pdf(name, data, images=True, ocr=True, on_progress=None, ticket=None):
+def classify(message):
+    """Colour category and badge for one log line (same rules as the desktop window)."""
+    m = message.lower()
+    if any(x in m for x in ("failed", "error", "exception", "traceback", "cannot find", "could not")): return "error", "ERROR"
+    if any(x in m for x in ("warning", "warn", "skipped", "skip", "not installed", "no text layer", "trying the next option")): return "warning", "WARN"
+    if any(x in m for x in ("success", "saved ", "wrote ", "finished", "complete", "ready.", "combined file written", "converted ", "ocr installed.")): return "success", "DONE"
+    if any(x in m for x in ("[info]", "[stage]", "starting", "opening", "reading", "analys", "processing", "page ", "ocr", "extract", "index",
+                            "merge order", "installing", "detecting", "writing", "converting")): return "info", "INFO"
+    return "detail", "LOG"
+
+
+def clean_line(line):
+    return re.sub(r"^\s*\[(INFO|SUCCESS|STAGE|ERROR|WARN|WARNING)\]\s*", "", line.rstrip("\r"), flags=re.I)
+
+
+def process_pdf(name, data, images=True, ocr=True, on_progress=None, ticket=None, on_status=None, on_log=None):
     """Convert PDF bytes. Returns dict(stem, zip_bytes, obs_bytes, chat_bytes, log). Raises TimeoutError past MAX_SECONDS."""
     stem = safe_stem(name)
     start = time.time()
@@ -127,12 +143,24 @@ def process_pdf(name, data, images=True, ocr=True, on_progress=None, ticket=None
         pdf = os.path.join(tmp, stem + ".pdf")
         with open(pdf, "wb") as f: f.write(data)
         buf = io.StringIO()
-        core.progress_cb = progress
+
+        class Sink:                                   # every printed line goes to the log and, live, to the page
+            def __init__(self): self.pending = ""
+            def write(self, v):
+                if not v: return 0
+                buf.write(v); self.pending += v
+                while "\n" in self.pending:
+                    line, self.pending = self.pending.split("\n", 1)
+                    if on_log and line.strip(): on_log(line)
+                return len(v)
+            def flush(self): pass
+
+        core.progress_cb, core.status_cb = progress, on_status
         try:
-            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            with contextlib.redirect_stdout(Sink()), contextlib.redirect_stderr(Sink()):
                 core.convert(pdf, images=images, ocr=ocr)
         finally:
-            core.progress_cb = None
+            core.progress_cb = core.status_cb = None
         obs = open(os.path.join(tmp, stem + "_obsidian.md"), "rb").read()
         chat = open(os.path.join(tmp, stem + "_chat.md"), "rb").read()
         out = io.BytesIO()
@@ -143,3 +171,21 @@ def process_pdf(name, data, images=True, ocr=True, on_progress=None, ticket=None
                 for n in sorted(os.listdir(imgdir)):
                     z.write(os.path.join(imgdir, n), f"{stem}/{stem}_images/{n}", compress_type=zipfile.ZIP_STORED)
         return {"stem": stem, "zip_bytes": out.getvalue(), "obs_bytes": obs, "chat_bytes": chat, "log": buf.getvalue().strip()}
+
+
+def merge_results(results, name="Combined"):
+    """Join several finished results (already in the wanted order) into one result of the same shape."""
+    name = core.clean_name(name)
+    fix = lambda t: re.sub(r"!\[\[(.*?)\]\]", lambda m: f"![[{name}_images/{m.group(1)}]]", t)
+    obs = core.merge_texts([(x["stem"], fix(x["obs_bytes"].decode("utf-8"))) for x in results], "obs").encode("utf-8")
+    chat = core.merge_texts([(x["stem"], x["chat_bytes"].decode("utf-8")) for x in results], "chat").encode("utf-8")
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(f"{name}/{name}_obsidian.md", obs)
+        for x in results:
+            with zipfile.ZipFile(io.BytesIO(x["zip_bytes"])) as zr:
+                for info in zr.infolist():
+                    if info.is_dir() or info.filename.endswith(".md"): continue
+                    z.writestr(f"{name}/{name}_images/{os.path.basename(info.filename)}", zr.read(info.filename), compress_type=zipfile.ZIP_STORED)
+    return {"stem": name, "zip_bytes": out.getvalue(), "obs_bytes": obs, "chat_bytes": chat,
+            "log": "\n\n".join(x["log"] for x in results), "note": f"Combined {len(results)} PDFs: " + ", ".join(x["stem"] for x in results)}

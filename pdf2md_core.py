@@ -1,4 +1,4 @@
-"""pdf2md core (used by the web app; also works as a command-line tool) - PDF slides -> Markdown that keeps text color, bold, italic, highlights, tables and images.
+"""pdf2md v3 (with combine option) - PDF slides -> Markdown that keeps text color, bold, italic, highlights, tables and images.
 
 SETUP (once)
     1. Install Python from python.org  (on Windows tick "Add python.exe to PATH").
@@ -10,7 +10,8 @@ RUN
     python pdf2md_v3.py "My Lecture.pdf" "Other.pdf"
     python pdf2md_v3.py "C:\\path\\to\\folder"     every PDF in a folder
     python pdf2md_v3.py                          every PDF in the current folder
-  Options:  --no-images   skip image extraction
+  Options:  --combine     merge all the PDFs into ONE note (use --name=Title and --order=name|given; default order is by file name)
+            --no-images   skip image extraction
             --no-ocr      do not OCR slides that have no text
 
 OUTPUT (next to each PDF)
@@ -29,6 +30,17 @@ WATERMARK_FRAC = 0.4        # a short line on more than 40% of pages is a waterm
 MIN_IMG_PT = 70             # ignore images smaller than this (points)
 MAX_IMG_PAGES = 5           # images on more pages than this are logos/backgrounds
 progress_cb = None          # optional: function(fraction 0..1) used by the window version
+status_cb = None            # optional: function(stage_text) used by the window version
+
+
+def report_stage(message):
+    """Send a human-readable stage update to the GUI and the command-line log."""
+    if status_cb:
+        try:
+            status_cb(message)
+        except Exception:
+            pass
+    print(f"[STAGE] {message}")
 
 
 # ---------- colors ----------
@@ -193,7 +205,9 @@ def page_content(page, ocr=False):
             prev = plain(p)
             nxt = plain(it)
             if prev and (prev[-1] not in ".:;?!" or nxt[:1].islower()):
-                p["segs"] += [(" ", None)] + it["segs"]; p["y"] = it["y"]; p["x1"] = max(p["x1"], it["x1"]); continue
+                p["segs"] += [(" ", None)] + it["segs"]
+                p.pop("_plain", None)  # wrapped-line merge changes the cached text
+                p["y"] = it["y"]; p["x1"] = max(p["x1"], it["x1"]); continue
         merged.append(it)
     out = merged + tables
     # reading order: keep PDF order for rows, put tables where their top edge falls
@@ -205,9 +219,17 @@ def page_content(page, ocr=False):
 
 
 def plain(it):
+    """Return normalized text, caching it until the item's segments are changed."""
+    cached = it.get("_plain")
+    if cached is not None:
+        return cached
     if it["kind"] == "table":
-        return " ".join(plain({"kind": "row", "segs": c}) for r in it["cells"] for c in r)
-    return re.sub(r"\s+", " ", "".join(t for t, _ in it["segs"])).strip()
+        value = " ".join(re.sub(r"\s+", " ", "".join(t for t, _ in cell)).strip()
+                         for row in it["cells"] for cell in row)
+    else:
+        value = re.sub(r"\s+", " ", "".join(t for t, _ in it["segs"])).strip()
+    it["_plain"] = value
+    return value
 
 
 # ---------- rendering ----------
@@ -316,21 +338,91 @@ def ocr_lines(page):
 
 
 # ---------- images ----------
+def _image_key(info):
+    """Properties shared by Page.get_image_info() and Page.get_images()."""
+    cs = str(info.get("cs-name", "")).lower()
+    # get_images() reports just "ICCBased", while get_image_info() includes
+    # the embedded ICC profile description in its cs-name value.
+    if cs.startswith("iccbased"):
+        cs = "iccbased"
+    return (int(info.get("width", 0)), int(info.get("height", 0)),
+            int(info.get("bpc", 0)), cs)
+
+
+def _image_infos_with_xrefs(page):
+    """Fast image placement lookup with an exact, slower fallback for ambiguous pages.
+
+    PyMuPDF's xrefs=True mode calculates image hashes to map placements to xrefs.
+    Most PDFs have unique image dimensions / bit depth / colorspace per page, so
+    we can map those safely from the page resource list without hashing. If two
+    different resources share the same metadata, use PyMuPDF's exact lookup.
+    """
+    infos = page.get_image_info(hashes=False, xrefs=False)
+    if not infos:
+        return infos
+    resources = collections.defaultdict(set)
+    for item in page.get_images(full=True):
+        if not item or not item[0]:
+            continue
+        try:
+            key = (int(item[2]), int(item[3]), int(item[4]), str(item[5]).lower())
+            resources[key].add(int(item[0]))
+        except (IndexError, TypeError, ValueError):
+            # Unknown resource metadata: let PyMuPDF perform the exact lookup.
+            return page.get_image_info(xrefs=True)
+
+    mapped = []
+    for info in infos:
+        matches = resources.get(_image_key(info), set())
+        if len(matches) != 1:
+            # Ambiguous resources or an unmatched inline/unusual image: do not guess.
+            # The exact method also handles nested forms and returns xref=0 for inline images.
+            return page.get_image_info(xrefs=True)
+        item = dict(info)
+        item["xref"] = next(iter(matches)) if matches else 0  # inline / unresolvable image
+        mapped.append(item)
+    return mapped
+
+
 def page_images(doc, page, usage, outdir, stem, pno, saved):
+    """Extract placed images efficiently, preserving original encoded bytes when safe.
+
+    Older code decoded every image to a Pixmap and re-encoded it as PNG. For ordinary
+    JPEG/PNG images that wastes CPU and often creates much larger files. Images with
+    masks or browser-unfriendly formats still use the Pixmap conversion fallback.
+    """
     found = []
-    for info in page.get_image_info(xrefs=True):
+    # Map xrefs without expensive hashes where the PDF's image resources are unambiguous.
+    for info in _image_infos_with_xrefs(page):
         xref = info.get("xref")
         r = fitz.Rect(info["bbox"]) & page.rect
-        if not xref or r.is_empty or r.width < MIN_IMG_PT or r.height < MIN_IMG_PT or usage[xref] > MAX_IMG_PAGES: continue
+        if not xref or r.is_empty or r.width < MIN_IMG_PT or r.height < MIN_IMG_PT or usage[xref] > MAX_IMG_PAGES:
+            continue
         if xref not in saved:
             try:
-                pix = fitz.Pixmap(doc, xref)
-                sm = doc.extract_image(xref).get("smask", 0)
-                if sm: pix = fitz.Pixmap(pix, fitz.Pixmap(doc, sm))
-                if pix.colorspace and pix.colorspace.n > 3: pix = fitz.Pixmap(fitz.csRGB, pix)
+                extracted = doc.extract_image(xref)
+                ext = (extracted.get("ext") or "").lower()
+                # These formats can be embedded directly by Obsidian/browser engines.
+                # Avoid decoding/re-encoding unless an alpha/color mask must be applied.
+                direct_ext = {"jpeg": "jpg", "jpg": "jpg", "png": "png", "gif": "gif",
+                              "bmp": "bmp", "webp": "webp"}
+                can_copy = (ext in direct_ext and info.get("colorspace") in (1, 3)
+                            and not extracted.get("smask", 0) and not info.get("has-mask", False))
                 os.makedirs(outdir, exist_ok=True)
-                name = f"{stem}_s{pno}_{len(saved)+1}.png"
-                pix.save(os.path.join(outdir, name)); saved[xref] = name
+                if can_copy:
+                    name = f"{stem}_s{pno}_{len(saved)+1}.{direct_ext[ext]}"
+                    with open(os.path.join(outdir, name), "wb") as fh:
+                        fh.write(extracted["image"])
+                else:
+                    pix = fitz.Pixmap(doc, xref)
+                    sm = extracted.get("smask", 0)
+                    if sm:
+                        pix = fitz.Pixmap(pix, fitz.Pixmap(doc, sm))
+                    if pix.colorspace and pix.colorspace.n > 3:
+                        pix = fitz.Pixmap(fitz.csRGB, pix)
+                    name = f"{stem}_s{pno}_{len(saved)+1}.png"
+                    pix.save(os.path.join(outdir, name))
+                saved[xref] = name
             except Exception:
                 continue
         found.append((saved[xref], r))
@@ -357,17 +449,28 @@ def place_images(entries, imgs):
 
 
 # ---------- main ----------
-def convert(path, images=True, ocr=True):
+def convert(path, images=True, ocr=True, outdir=None, stem=None):
+    filename = os.path.basename(path)
+    report_stage(f"Opening {filename}")
     doc = fitz.open(path)
-    base = os.path.splitext(path)[0]
-    stem = os.path.basename(base)
+    stem = stem or os.path.splitext(filename)[0]
+    base = os.path.join(outdir or os.path.dirname(os.path.abspath(path)), stem)
     imgdir = base + "_images"
     n = len(doc)
-    print(f"\n{os.path.basename(path)}: {n} pages")
+    print(f"\n[INFO] {filename}: {n} pages detected")
+    report_stage("Reading page text, formatting and layout")
     pages = []
+    scan_stride = max(1, n // 18)
     for i in range(n):
         pages.append(page_content(doc[i]))
-        if progress_cb: progress_cb(0.6 * (i + 1) / n)
+        if progress_cb: progress_cb(0.02 + 0.23 * (i + 1) / max(1, n))
+        if (i + 1) % scan_stride == 0 or i + 1 == n:
+            msg = f"Analysed page text and layout: {i + 1}/{n}"
+            if status_cb:
+                try: status_cb(msg)
+                except Exception: pass
+            print(f"[INFO] {msg}")
+    report_stage("Detecting repeated headers and animation build-ups")
     cnt = collections.Counter()
     for ents in pages:
         for t in {plain(e) for e in ents if e["kind"] == "row"}: cnt[t] += 1
@@ -379,14 +482,25 @@ def convert(path, images=True, ocr=True):
         nxt = {plain(e) for e in pages[i + 1]} if i + 1 < n else set()
         if cur and nxt and cur <= nxt: continue
         keep.append(i)
+    print(f"[SUCCESS] Slide filtering complete: {len(keep)} kept, {n - len(keep)} build-up slides removed")
     usage = collections.Counter()
     if images:
+        report_stage("Indexing embedded images")
         for i in keep:
             for im in doc[i].get_images(): usage[im[0]] += 1
+        print(f"[INFO] Found {len(usage)} distinct embedded image resources")
     saved, textless, ncolor, ntables, nocr = {}, [], 0, 0, 0
     out = {"obs": [], "chat": []}
+    report_stage("Extracting images and building Markdown")
+    process_stride = max(1, len(keep) // 18)
     for ki, i in enumerate(keep):
-        if progress_cb: progress_cb(0.6 + 0.4 * ki / max(1, len(keep)))
+        if progress_cb: progress_cb(0.27 + 0.62 * (ki + 1) / max(1, len(keep)))
+        if ki % process_stride == 0 or ki + 1 == len(keep):
+            msg = f"Processing slide {ki + 1}/{len(keep)} (PDF page {i + 1})"
+            if status_cb:
+                try: status_cb(msg)
+                except Exception: pass
+            print(f"[INFO] {msg}")
         ents = list(pages[i])
         page = doc[i]
         notext = not ents
@@ -395,6 +509,7 @@ def convert(path, images=True, ocr=True):
             textless.append(i + 1)
             if images and not imgs: imgs = [(snapshot(page, imgdir, stem, i + 1), page.rect)]
         if notext and ocr:
+            print(f"[INFO] OCR: reading picture-only page {i + 1}")
             lines_found = ocr_lines(page)
             if lines_found: ents.append({"kind": "ocr", "lines": lines_found, "y": 1e9}); nocr += 1
         place_images(ents, imgs)
@@ -426,6 +541,8 @@ def convert(path, images=True, ocr=True):
                 first = False
             if notext and mode == "chat" and not any(e["kind"] == "ocr" for e in ents): lines.append("[slide has no text, picture only]")
             out[mode].append("\n".join(lines).strip())
+    report_stage("Writing Obsidian and compact Markdown files")
+    if progress_cb: progress_cb(0.94)
     for mode, suffix in (("obs", "_obsidian.md"), ("chat", "_chat.md")):
         text = "\n\n---\n\n".join(p for p in out[mode] if p).strip() + "\n"
         text = re.sub(r"(?<![A-Za-z0-9])o(?=[A-Z][a-z])", "\x00", text).replace("\n\x00", "\n  - ").replace("\x00", "\n  - ")
@@ -438,12 +555,107 @@ def convert(path, images=True, ocr=True):
         else:
             ncolor = len(re.findall(r'<span style|==|<mark', text)); ntables = len(re.findall(r"\n\| --- ", text))
         with open(base + suffix, "w", encoding="utf-8") as f: f.write(text)
-        print(f"  wrote {os.path.basename(base + suffix)} ({len(text)} characters, about {len(text)//4} tokens)")
-    print(f"  {len(keep)} slides kept ({n - len(keep)} animation build-ups removed), {ncolor} colored/highlighted pieces, "
+        print(f"[SUCCESS] Saved {os.path.basename(base + suffix)} ({len(text)} characters, about {len(text)//4} tokens)")
+        if progress_cb: progress_cb(0.94 + (0.05 if mode == "obs" else 0.06))
+    print(f"[SUCCESS] {len(keep)} slides kept ({n - len(keep)} animation build-ups removed), {ncolor} colored/highlighted pieces, "
           f"{ntables} tables, {len(saved)} images saved, {nocr} picture-only slides OCR'd")
     if textless:
-        print(f"  slides with no text layer: {textless[:25]}{' ...' if len(textless) > 25 else ''}"
-              + ("  (kept as pictures)" if images else "") + ("" if ocr else "  (OCR is off)"))
+        print(f"[WARN] Slides with no text layer: {textless[:25]}{' ...' if len(textless) > 25 else ''}"
+              + (" (kept as pictures)" if images else "") + (" (OCR is off)" if not ocr else ""))
+    if progress_cb: progress_cb(1.0)
+    report_stage(f"Finished {filename}")
+
+
+# ---------- combining several PDFs into one ----------
+def natural_key(text):
+    """Sort key so that 'Lecture 2' comes before 'Lecture 10'."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", text)]
+
+
+def order_indices(names, mode="name", numbers=None):
+    """Return the positions of names in the order they should be merged.
+    mode: 'name' (natural sort by file name), 'given' (as listed), 'numbers' (sort by the numbers typed, ties keep list order)."""
+    idx = list(range(len(names)))
+    if mode == "name": idx.sort(key=lambda i: natural_key(os.path.basename(names[i])))
+    elif mode == "numbers" and numbers: idx.sort(key=lambda i: (float(numbers[i]), i))
+    return idx
+
+
+def legend_line(text):
+    tags = sorted(set(re.findall(r"<((?:bg-)?[a-z]+)>", text)))
+    if not tags: return ""
+    return ("Legend: " + "; ".join((f"<{t}> = {t[3:]} highlight" if t.startswith("bg-") else f"<{t}> = {t} text") for t in tags)
+            + "; ** = bold; * = italic. These mark what the teacher emphasized.\n\n")
+
+
+def merge_texts(parts, mode):
+    """parts = [(title, markdown text)] in final order. One title heading per file; one shared legend for chat mode."""
+    chunks = []
+    for title, text in parts:
+        if mode == "chat": text = re.sub(r"\ALegend: [^\n]*\n\n", "", text)
+        chunks.append(f"# {title}\n\n{text.strip()}")
+    out = "\n\n---\n\n".join(chunks) + "\n"
+    return (legend_line(out) + out) if mode == "chat" else out
+
+
+def clean_name(text, default="Combined"):
+    return (re.sub(r"[^\w\-. ()]+", "_", text).strip(" ._") or default)[:80]
+
+
+def combine_files(files, name="Combined", images=True, ocr=True, out_dir=None, order="name", numbers=None):
+    """Convert several PDFs and write ONE combined Obsidian note, ONE combined chat file and one images folder."""
+    global progress_cb
+    import shutil, tempfile
+    ordered = [files[i] for i in order_indices(files, order, numbers)]
+    out_dir = out_dir or os.path.dirname(os.path.abspath(ordered[0]))
+    name = clean_name(name)
+    outer, n, used = progress_cb, len(ordered), set()
+    obs_parts, chat_parts = [], []
+    print("[INFO] Merge order: " + "  ->  ".join(f"{k + 1}. {os.path.basename(f)}" for k, f in enumerate(ordered)))
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            img_out = os.path.join(out_dir, name + "_images")
+            for k, f in enumerate(ordered):
+                report_stage(f"Converting PDF {k + 1}/{n}: {os.path.basename(f)}")
+                title = clean_name(os.path.splitext(os.path.basename(f))[0], "slides")
+                stem, j = title, 2
+                while stem in used: stem = f"{title}_{j}"; j += 1
+                used.add(stem)
+                progress_cb = (lambda fr, k=k: outer((k + fr) / n)) if outer else None
+                try:
+                    convert(f, images, ocr, outdir=tmp, stem=stem)
+                except Exception as e:
+                    print(f"[ERROR] Failed on {f}: {e}"); continue
+                print(f"[SUCCESS] Converted {os.path.basename(f)}; preparing its combined section")
+                obs_text = open(os.path.join(tmp, stem + "_obsidian.md"), encoding="utf-8").read()
+                chat_text = open(os.path.join(tmp, stem + "_chat.md"), encoding="utf-8").read()
+                # Images are gathered into one shared folder beside the combined note.
+                # Update Obsidian embeds so they still resolve after being moved.
+                image_folder = name + "_images"
+                obs_text = re.sub(
+                    r"!\[\[(.*?)\]\]",
+                    lambda m: f"![[{image_folder}/{m.group(1)}]]",
+                    obs_text
+                )
+                obs_parts.append((title, obs_text))
+                chat_parts.append((title, chat_text))
+                d = os.path.join(tmp, stem + "_images")
+                if os.path.isdir(d):
+                    os.makedirs(img_out, exist_ok=True)
+                    for fn in os.listdir(d): shutil.move(os.path.join(d, fn), os.path.join(img_out, fn))
+    finally:
+        progress_cb = outer
+    if not obs_parts: raise RuntimeError("None of the PDFs could be converted.")
+    report_stage("Merging converted sections and finalising shared image links")
+    paths = {}
+    for mode, parts, suffix in (("obs", obs_parts, "_obsidian.md"), ("chat", chat_parts, "_chat.md")):
+        text = merge_texts(parts, mode)
+        paths[mode] = os.path.join(out_dir, name + suffix)
+        with open(paths[mode], "w", encoding="utf-8") as fh: fh.write(text)
+        print(f"[SUCCESS] Combined file written: {paths[mode]} ({len(text)} characters, about {len(text)//4} tokens)")
+    if progress_cb: progress_cb(1.0)
+    report_stage("Combined export complete")
+    return paths
 
 
 if __name__ == "__main__":
@@ -455,6 +667,11 @@ if __name__ == "__main__":
         if os.path.isdir(a): files += sorted(glob.glob(os.path.join(a, "*.pdf")))
         else: files += sorted(glob.glob(a)) or [a]
     if not files: sys.exit("No PDF files found. Put this script in the folder with your PDFs, or pass a file name.")
+    if "--combine" in flags:
+        name = next((a[7:] for a in flags if a.startswith("--name=")), "Combined")
+        order = next((a[8:] for a in flags if a.startswith("--order=")), "name")
+        combine_files(files, name, images="--no-images" not in flags, ocr="--no-ocr" not in flags, order=order)
+        sys.exit(0)
     for f in files:
         try: convert(f, images="--no-images" not in flags, ocr="--no-ocr" not in flags)
         except Exception as e: print(f"  FAILED on {f}: {e}")
